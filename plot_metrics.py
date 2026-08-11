@@ -1,28 +1,5 @@
 #!/usr/bin/env python3
-"""
-plot_metrics.py — строит графики по metrics.csv, который создают
-profile_hnsw_build_and_search.sh / profile_hnsw_halfvec_build_and_search.sh
 
-Использование:
-    python3 plot_metrics.py /path/to/perf-results/20260809_120000/metrics.csv
-
-Если путь не передан — берётся metrics.csv из самой свежей папки
-в ~/perf-results/.
-
-Группирует линии по колонке "role" (build-load / build-index / search),
-если она есть в CSV — иначе по старой колонке "phase" (build / search),
-для совместимости со старыми файлами.
-
-С версии, где profile_*.sh собирает раздельные L1/L2/LLC события
-(вместо generic cache-references/cache-misses), скрипт рисует miss-rate
-ОТДЕЛЬНО по каждому уровню кэша — так графики Intel и AMD сравнимы
-между собой (сравниваем L3 vs L3, а не L3 Intel против L2 AMD).
-Если в CSV есть только старые generic-события — рисуется единственная
-"cache" панель, как раньше (обратная совместимость).
-
-Требуются pandas и matplotlib:
-    pip install pandas matplotlib --break-system-packages
-"""
 import sys
 import os
 import glob
