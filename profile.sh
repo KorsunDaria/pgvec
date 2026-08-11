@@ -1,0 +1,446 @@
+#!/usr/bin/env bash
+# profile_hnsw_build_and_search.sh
+#
+# Запускает HNSW-тест pgvector в ДВА отдельных прохода:
+#   ФАЗА 1 — только построение индекса (drop_old + load + CREATE INDEX)
+#   ФАЗА 2 — только поиск (search_serial + search_concurrent)
+#
+# КАК ОПРЕДЕЛЯЕТСЯ, ЧТО ИМЕННО СТРОИТ ИНДЕКС / ИЩЕТ (без угадывания):
+#   1) Дерево процессов: находим PID postmaster'а и рекурсивно (pgrep -P)
+#      собираем ВСЕХ его потомков — это единственный надёжный источник
+#      "кто вообще существует", вместо угадывания по факту подключения.
+#   2) Для каждого потомка сверяем ДВА независимых источника роли:
+#        a) pg_stat_activity.query (+ leader_pid для parallel workers,
+#           у воркера своего query нет — берём query у его лидера)
+#        b) системный cmdline процесса (postgres переписывает argv:
+#           "... CREATE INDEX", "... SELECT ...",
+#           "parallel worker for PID <N>")
+#      Если оба источника согласны — используем эту роль. Если SQL не дал
+#      роль (например, недостаточно прав видеть чужой query), берём роль
+#      из cmdline. При явном конфликте — доверяем SQL (текст запроса
+#      точнее показывает, что именно выполняется) и пишем WARN в лог.
+#   3) В сегмент perf на каждой фазе попадают ТОЛЬКО pid'ы с ролью,
+#      соответствующей текущей фазе (build/search) — посторонние backend'ы
+#      (autovacuum, мониторинг и т.п.) не подмешиваются.
+#
+# ФОРМАТ ВЫВОДА:
+#   perf запускается с "-x," — это встроенный CSV-вывод perf (числа сразу
+#   в разделённых запятыми полях, парсить проще и надёжнее, чем текстовый
+#   "-I 1000" лог). Значения — это СУММА счётчиков по всем pid, отданным
+#   в -p (perf агрегирует их сам, без разбивки по отдельным pid).
+#   В конце скрипта все сегменты обеих фаз собираются в один
+#   $OUT_DIR/metrics.csv с колонками:
+#     phase,segment,start_epoch,timestamp_sec,pids,event,value,unit,run_time_ns,pct_time_enabled
+#   Именно этот файл удобно кормить в matplotlib/pandas для графика.
+#
+# ВАЖНО ПЕРЕД ЗАПУСКОМ:
+#   1) venv должен быть активирован: source ~/bench-env/bin/activate
+#   2) права на perf-счётчики. Один раз:
+#        sudo sysctl -w kernel.perf_event_paranoid=-1
+#   3) Регэкспы, определяющие "build"/"search" запросы (BUILD_QUERY_RE /
+#      SEARCH_QUERY_RE ниже), настроены под типичные запросы
+#      vectordbbench (CREATE INDEX / COPY / INSERT для построения,
+#      SELECT ... ORDER BY ... <=> ... для поиска). Если у тебя другой
+#      бенчмарк-тул с другим текстом запроса — подправь эти регэкспы.
+#
+# Запуск:
+#   chmod +x profile_hnsw_build_and_search.sh
+#   ./profile_hnsw_build_and_search.sh
+
+set -uo pipefail
+
+# ---------------- Настройки: поменяй под себя ----------------
+export POSTGRES_PASSWORD="test123"
+DB_HOST="127.0.0.1"
+DB_PORT="5432"
+DB_NAME="test"
+DB_USER="daria"
+CASE_TYPE="Performance1536D50K"
+HNSW_M=32
+HNSW_EF_CONSTRUCTION=128
+HNSW_EF_SEARCH=128
+MAINT_WORK_MEM="6GB"
+MAX_PARALLEL_WORKERS=12
+
+# Регэкспы (в верхнем регистре, сравнение всегда идёт с UPPER-строкой)
+# build разбит на два подтипа, чтобы можно было сравнивать "чисто
+# построение индекса" отдельно от "загрузки данных" (а не одной кучей,
+# как раньше) — это важно для честного сравнения с halfvec-индексом,
+# где load вообще не профилируется.
+BUILD_LOAD_RE='^(COPY|INSERT INTO|CREATE TABLE|ALTER TABLE|DROP TABLE)'
+BUILD_INDEX_RE='^(CREATE INDEX|DROP INDEX)'
+SEARCH_QUERY_RE='^SELECT'
+# ---------------------------------------------------------------
+
+OUT_DIR="$HOME/perf-results/$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$OUT_DIR"
+echo "Результаты будут в: $OUT_DIR"
+
+# ---------------------------------------------------------------
+# Определяем вендора CPU и подбираем ЯВНЫЕ (raw) perf-события,
+# а не generic cache-references/cache-misses — маппинг generic-alias
+# на конкретный PMU-event разный у Intel и AMD (Intel обычно уходит
+# в LLC-уровень, AMD в L2-уровень), из-за чего проценты не сравнимы
+# между машинами. Здесь фиксируем L1 / L2 / L3(LLC) явно и одинаково
+# по смыслу на обеих архитектурах.
+#
+# Если какое-то событие не поддерживается конкретной моделью CPU,
+# perf просто выдаст <not supported> в этой колонке — не страшно,
+# остальные события всё равно соберутся.
+# ---------------------------------------------------------------
+CPU_VENDOR="$(grep -m1 -i vendor_id /proc/cpuinfo | awk '{print $NF}')"
+
+if [[ "$CPU_VENDOR" == "GenuineIntel" ]]; then
+  CANDIDATE_EVENTS="cycles instructions L1-dcache-loads L1-dcache-load-misses l2_rqsts.references l2_rqsts.miss LLC-loads LLC-load-misses"
+elif [[ "$CPU_VENDOR" == "AuthenticAMD" ]]; then
+  CANDIDATE_EVENTS="cycles instructions L1-dcache-loads L1-dcache-load-misses l2_request_g1.all_no_prefetch l2_cache_miss LLC-loads LLC-load-misses"
+else
+  echo "[WARN] Неизвестный вендор CPU '$CPU_VENDOR', использую generic-события (могут быть не сравнимы между машинами)" >&2
+  CANDIDATE_EVENTS="cycles instructions cache-references cache-misses"
+fi
+
+echo "CPU vendor: $CPU_VENDOR"
+
+# ---------------------------------------------------------------
+# Проверяем КАЖДОЕ событие по отдельности (а не всю строку разом) —
+# так одно неподдерживаемое имя не роняет сбор остальных событий
+# на этом CPU/ядре молча, как это произошло на ThinkPad E590
+# (perf при ошибке в ОДНОМ событии из списка -e не пишет вообще
+# ничего, даже для рабочих событий).
+# ---------------------------------------------------------------
+: > "$OUT_DIR/perf_events_check.log"
+OK_EVENTS=()
+for ev in $CANDIDATE_EVENTS; do
+  if sudo perf stat -e "$ev" -x, -- sleep 0.05 >/dev/null 2>>"$OUT_DIR/perf_events_check.log"; then
+    OK_EVENTS+=("$ev")
+  else
+    echo "[WARN] событие '$ev' не поддерживается этим CPU/ядром — исключаю из сбора" >&2
+  fi
+done
+
+if [[ ${#OK_EVENTS[@]} -eq 0 ]]; then
+  echo "[FATAL] Ни одно perf-событие не прошло проверку. Смотри $OUT_DIR/perf_events_check.log и 'perf list'." >&2
+  exit 1
+fi
+
+PERF_EVENTS="$(IFS=,; echo "${OK_EVENTS[*]}")"
+echo "perf events (после проверки): $PERF_EVENTS"
+
+PSQL_BASE=(psql -h "$DB_HOST" -p "$DB_PORT" -d "$DB_NAME" -U "$DB_USER")
+
+sudo -v
+( while true; do sudo -v; sleep 60; done ) &
+KEEPALIVE_PID=$!
+trap 'kill "$KEEPALIVE_PID" 2>/dev/null' EXIT
+
+COMMON_ARGS=(
+  --case-type "$CASE_TYPE"
+  --host "$DB_HOST" --port "$DB_PORT" --db-name "$DB_NAME" --user-name "$DB_USER"
+  --m "$HNSW_M" --ef-construction "$HNSW_EF_CONSTRUCTION" --ef-search "$HNSW_EF_SEARCH"
+  --maintenance-work-mem "$MAINT_WORK_MEM" --max-parallel-workers "$MAX_PARALLEL_WORKERS"
+)
+
+# ---------------------------------------------------------------
+# Дерево процессов: находим postmaster и всех его потомков.
+# ---------------------------------------------------------------
+get_postmaster_pid() {
+  local datadir pidfile_pid
+  datadir="$("${PSQL_BASE[@]}" -t -A -c "SHOW data_directory;" 2>/dev/null)"
+  if [[ -n "$datadir" ]]; then
+    pidfile_pid="$(sudo head -n1 "$datadir/postmaster.pid" 2>/dev/null)"
+    if [[ "$pidfile_pid" =~ ^[0-9]+$ ]]; then
+      echo "$pidfile_pid"
+      return 0
+    fi
+  fi
+  # Фолбэк, если не смогли прочитать postmaster.pid (нет прав/пути)
+  pgrep -o -x postgres
+}
+
+get_descendant_pids() {
+  local root="$1"
+  local children
+  children="$(pgrep -P "$root" 2>/dev/null)"
+  local c
+  for c in $children; do
+    echo "$c"
+    get_descendant_pids "$c"
+  done
+}
+
+POSTMASTER_PID="$(get_postmaster_pid)"
+if [[ -z "$POSTMASTER_PID" ]]; then
+  echo "Не удалось определить PID postmaster'а, прерываю." >&2
+  exit 1
+fi
+echo "postmaster PID: $POSTMASTER_PID"
+
+# ---------------------------------------------------------------
+# Классификация ролей: SQL (query/leader_pid) + cmdline, с кросс-проверкой.
+# Заполняет глобальные ассоциативные массивы SQL_ROLE / FINAL_ROLE.
+# ---------------------------------------------------------------
+classify_all_pids() {
+  declare -gA SQL_ROLE=()
+  declare -gA FINAL_ROLE=()
+
+  local sql="
+    SELECT a.pid,
+           a.backend_type,
+           CASE WHEN a.leader_pid IS NULL THEN a.query ELSE l.query END AS eff_query
+    FROM pg_stat_activity a
+    LEFT JOIN pg_stat_activity l ON l.pid = a.leader_pid
+    WHERE a.datname = '$DB_NAME'
+      AND a.pid <> pg_backend_pid();
+  "
+
+  local pid backend_type query query_upper role
+  while IFS='|' read -r pid backend_type query; do
+    [[ -z "$pid" ]] && continue
+    query_upper="${query^^}"
+    role="other"
+    if [[ "$query_upper" =~ $BUILD_INDEX_RE ]]; then
+      role="build-index"
+    elif [[ "$query_upper" =~ $BUILD_LOAD_RE ]]; then
+      role="build-load"
+    elif [[ "$query_upper" =~ $SEARCH_QUERY_RE ]]; then
+      role="search"
+    fi
+    SQL_ROLE["$pid"]="$role"
+  done < <("${PSQL_BASE[@]}" -F'|' -t -A -c "$sql" 2>/dev/null)
+
+  # Кандидаты = дерево процессов postmaster'а (надёжный источник "кто есть")
+  local worker_re='PARALLEL WORKER FOR PID ([0-9]+)'
+  local candidate
+  while read -r candidate; do
+    [[ -z "$candidate" ]] && continue
+    local ps_args ps_args_upper ps_role sql_role leader_from_ps
+    ps_args="$(ps -o args= -p "$candidate" 2>/dev/null)"
+    ps_args_upper="${ps_args^^}"
+    ps_role="other"
+    if [[ "$ps_args_upper" =~ CREATE\ INDEX ]]; then
+      ps_role="build-index"
+    elif [[ "$ps_args_upper" =~ $worker_re ]]; then
+      leader_from_ps="${BASH_REMATCH[1]}"
+      ps_role="${SQL_ROLE[$leader_from_ps]:-other}"
+    elif [[ "$ps_args_upper" =~ ^POSTGRES:.*SELECT ]]; then
+      ps_role="search"
+    elif [[ "$ps_args_upper" =~ (COPY|INSERT\ INTO|CREATE\ TABLE) ]]; then
+      ps_role="build-load"
+    fi
+
+    sql_role="${SQL_ROLE[$candidate]:-other}"
+
+    if [[ "$sql_role" == "$ps_role" ]]; then
+      FINAL_ROLE["$candidate"]="$sql_role"
+    elif [[ "$sql_role" == "other" && "$ps_role" != "other" ]]; then
+      FINAL_ROLE["$candidate"]="$ps_role"
+    elif [[ "$ps_role" == "other" && "$sql_role" != "other" ]]; then
+      FINAL_ROLE["$candidate"]="$sql_role"
+    else
+      echo "[WARN] pid=$candidate: SQL-роль='$sql_role' vs ps-роль='$ps_role' — конфликт, доверяю SQL" >&2
+      FINAL_ROLE["$candidate"]="$sql_role"
+    fi
+  done < <(get_descendant_pids "$POSTMASTER_PID")
+}
+
+# Возвращает (в глобальных переменных TARGET_PID_CSV / TARGET_PIDROLE_CSV)
+# pid'ы для текущей фазы $1 ("build" или "search"). "build" ловит ОБА
+# подтипа (build-load И build-index) — perf всё равно профилирует
+# фазу целиком, а точный подтип каждого pid сохраняется в
+# TARGET_PIDROLE_CSV и попадает в metrics.csv как отдельная колонка
+# role, по которой потом можно фильтровать build-index отдельно от
+# build-load.
+get_target_pids() {
+  local target_role="$1"
+  classify_all_pids
+  TARGET_PID_CSV=""
+  TARGET_PIDROLE_CSV=""
+  local pid r
+  for pid in "${!FINAL_ROLE[@]}"; do
+    r="${FINAL_ROLE[$pid]}"
+    if [[ "$target_role" == "build" && "$r" == build-* ]] || [[ "$r" == "$target_role" ]]; then
+      TARGET_PID_CSV+="${TARGET_PID_CSV:+,}$pid"
+      TARGET_PIDROLE_CSV+="${TARGET_PIDROLE_CSV:+,}${pid}:${r}"
+    fi
+  done
+}
+
+# ---------------------------------------------------------------
+# Профилирование фазы: пока команда работает, раз в секунду сверяем
+# набор целевых pid (по роли), при изменении — перезапускаем perf на
+# новом наборе, каждый сегмент пишем в CSV (perf -x,) + .meta с
+# метаданными (phase/segment/pids-и-роли).
+# ---------------------------------------------------------------
+profile_phase() {
+  local out_prefix="$1"
+  local label="$2"       # "build" | "search" — совпадает с ролью цели
+  shift 2
+
+  "$@" &
+  local main_pid=$!
+
+  local seg=0
+  local current_pid_csv=""
+  local perf_pid=""
+
+  while kill -0 "$main_pid" 2>/dev/null; do
+    get_target_pids "$label"
+    if [[ -n "$TARGET_PID_CSV" && "$TARGET_PID_CSV" != "$current_pid_csv" ]]; then
+      if [[ -n "$perf_pid" ]]; then
+        sudo kill -INT "$perf_pid" 2>/dev/null
+        wait "$perf_pid" 2>/dev/null
+      fi
+      seg=$((seg + 1))
+      echo "[$label] Целевые pid изменились: $TARGET_PID_CSV -> сегмент $seg"
+
+      cat > "${out_prefix}.seg${seg}.meta" <<EOF
+phase=$label
+segment=$seg
+start_epoch=$(date +%s)
+pids=$TARGET_PIDROLE_CSV
+EOF
+
+      sudo perf stat -x, -e "$PERF_EVENTS" \
+        -p "$TARGET_PID_CSV" -I 1000 -o "${out_prefix}.seg${seg}.csv" &
+      perf_pid=$!
+      current_pid_csv="$TARGET_PID_CSV"
+    fi
+    sleep 1
+  done
+
+  wait "$main_pid" 2>/dev/null
+  local exit_code=$?
+
+  if [[ -n "$perf_pid" ]]; then
+    sudo kill -INT "$perf_pid" 2>/dev/null
+    wait "$perf_pid" 2>/dev/null
+  fi
+
+  echo "[$label] Готово. Сегментов: $seg (файлы: ${out_prefix}.seg*.csv)"
+  return $exit_code
+}
+
+# ================= ФАЗА 1: построение индекса =================
+echo ""
+echo "=== ФАЗА 1: drop_old + load + build index ==="
+
+profile_phase "$OUT_DIR/perf_build" "build" \
+  vectordbbench pgvectorhnsw "${COMMON_ARGS[@]}" \
+    --drop-old --load --skip-search-serial --skip-search-concurrent \
+    > "$OUT_DIR/build_stdout.log" 2>&1
+
+echo "=== ФАЗА 1 завершена ==="
+
+# ================= ФАЗА 2: только поиск =================
+echo ""
+echo "=== ФАЗА 2: search_serial + search_concurrent (без пересборки) ==="
+
+profile_phase "$OUT_DIR/perf_search" "search" \
+  vectordbbench pgvectorhnsw "${COMMON_ARGS[@]}" \
+    --skip-drop-old --skip-load --search-serial --search-concurrent \
+    > "$OUT_DIR/search_stdout.log" 2>&1
+
+echo "=== ФАЗА 2 завершена ==="
+
+# ================= Сборка итогового CSV =================
+echo ""
+echo "=== Собираю metrics.csv из всех сегментов ==="
+
+OUT_DIR="$OUT_DIR" python3 - <<'PY'
+import csv, glob, os, re
+
+out_dir = os.environ["OUT_DIR"]
+# Раньше здесь был жёсткий список из 4 generic-имён. Теперь события
+# зависят от вендора CPU (см. PERF_EVENTS в самом скрипте) и могут
+# называться L2_RQSTS.MISS, l2_cache_miss, LLC-load-misses и т.д.
+# Отбрасываем только явный мусор perf (пустые строки/интерлив), а не
+# конкретные имена — иначе новые события будут молча вырезаны.
+event_re = re.compile(r"^[A-Za-z0-9_.\-]+$")
+rows = []
+
+for meta_path in sorted(glob.glob(os.path.join(out_dir, "perf_*.seg*.meta"))):
+    csv_path = meta_path[:-5] + ".csv"
+    if not os.path.exists(csv_path):
+        continue
+
+    meta = {}
+    pids_field = ""
+    with open(meta_path) as mf:
+        for line in mf:
+            line = line.strip()
+            if not line or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            if k == "pids":
+                pids_field = v
+            else:
+                meta[k] = v
+
+    # pids_field выглядит как "1234:build-index,1235:build-index" —
+    # вытаскиваем точную под-роль (build-load / build-index / search),
+    # чтобы можно было сравнивать build-index отдельно от build-load.
+    role_names = set()
+    for item in pids_field.split(","):
+        if ":" in item:
+            role_names.add(item.split(":", 1)[1])
+    if len(role_names) == 1:
+        role_value = next(iter(role_names))
+    elif role_names:
+        role_value = "mixed(" + "+".join(sorted(role_names)) + ")"
+    else:
+        role_value = ""
+
+    with open(csv_path, newline="") as cf:
+        for raw in cf:
+            raw = raw.rstrip("\n")
+            if not raw or raw.startswith("#"):
+                continue
+            fields = raw.split(",")
+            # perf stat -x, -I <ms> формат:
+            # time,value,unit,event,run_time_ns,pct_time_enabled[,...]
+            if len(fields) < 4:
+                continue
+            timestamp, value, unit, event = fields[0], fields[1], fields[2], fields[3]
+            run_ns = fields[4] if len(fields) > 4 else ""
+            pct = fields[5] if len(fields) > 5 else ""
+            if not event_re.match(event):
+                continue
+            rows.append({
+                "phase": meta.get("phase", ""),
+                "role": role_value,
+                "segment": meta.get("segment", ""),
+                "start_epoch": meta.get("start_epoch", ""),
+                "timestamp_sec": timestamp,
+                "pids": pids_field,
+                "event": event,
+                "value": value,
+                "unit": unit,
+                "run_time_ns": run_ns,
+                "pct_time_enabled": pct,
+            })
+
+out_csv = os.path.join(out_dir, "metrics.csv")
+fieldnames = ["phase", "role", "segment", "start_epoch", "timestamp_sec", "pids",
+              "event", "value", "unit", "run_time_ns", "pct_time_enabled"]
+with open(out_csv, "w", newline="") as f:
+    w = csv.DictWriter(f, fieldnames=fieldnames)
+    w.writeheader()
+    w.writerows(rows)
+
+print(f"Итоговый CSV: {out_csv} ({len(rows)} строк)")
+PY
+
+# ================= Итог =================
+echo ""
+echo "Готово. Файлы:"
+echo "  Лог фазы построения:       $OUT_DIR/build_stdout.log"
+echo "  Сырые perf-сегменты (CSV): $OUT_DIR/perf_build.seg*.csv (+ .meta)"
+echo "  Лог фазы поиска:           $OUT_DIR/search_stdout.log"
+echo "  Сырые perf-сегменты (CSV): $OUT_DIR/perf_search.seg*.csv (+ .meta)"
+echo "  ИТОГОВЫЙ CSV для графика:  $OUT_DIR/metrics.csv"
+echo ""
+echo "Стандартные метрики (QPS, recall, latency, insert_duration, optimize_duration, index_size)"
+echo "ищи в JSON-файлах здесь:"
+echo "  ~/bench-env/lib/python3.14/site-packages/vectordb_bench/results/PgVector/"
+echo ""
+echo "OUT_DIR=$OUT_DIR"
