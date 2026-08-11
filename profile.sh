@@ -6,21 +6,21 @@ set -uo pipefail
 export POSTGRES_PASSWORD="test123"
 DB_HOST="127.0.0.1"
 DB_PORT="5432"
-DB_NAME="test"
-DB_USER="daria"
+DB_NAME="postgres"
+DB_USER="ivy"
 CASE_TYPE="Performance1536D50K"
 HNSW_M=32
 HNSW_EF_CONSTRUCTION=128
 HNSW_EF_SEARCH=128
 MAINT_WORK_MEM="6GB"
-MAX_PARALLEL_WORKERS=12
+MAX_PARALLEL_WORKERS=6
 
 BUILD_LOAD_RE='^(COPY|INSERT INTO|CREATE TABLE|ALTER TABLE|DROP TABLE)'
 BUILD_INDEX_RE='^(CREATE INDEX|DROP INDEX)'
 SEARCH_QUERY_RE='^SELECT'
 # ---------------------------------------------------------------
 
-OUT_DIR="$HOME/perf-results/$(date +%Y%m%d_%H%M%S)"
+OUT_DIR="perf-results/$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$OUT_DIR"
 echo "Результаты будут в: $OUT_DIR"
 
@@ -28,34 +28,16 @@ echo "Результаты будут в: $OUT_DIR"
 CPU_VENDOR="$(grep -m1 -i vendor_id /proc/cpuinfo | awk '{print $NF}')"
 
 if [[ "$CPU_VENDOR" == "GenuineIntel" ]]; then
-  CANDIDATE_EVENTS="cycles instructions L1-dcache-loads L1-dcache-load-misses l2_rqsts.references l2_rqsts.miss LLC-loads LLC-load-misses"
+  PERF_EVENTS="cycles,instructions,L1-dcache-loads,L1-dcache-load-misses,l2_rqsts.references,l2_rqsts.miss,LLC-loads,LLC-load-misses"
 elif [[ "$CPU_VENDOR" == "AuthenticAMD" ]]; then
-  CANDIDATE_EVENTS="cycles instructions L1-dcache-loads L1-dcache-load-misses l2_request_g1.all_no_prefetch l2_cache_miss LLC-loads LLC-load-misses"
+  PERF_EVENTS="cycles,instructions,r0729,rE860,r8060,r0864,rff64,rff43"
 else
   echo "[WARN] Неизвестный вендор CPU '$CPU_VENDOR', использую generic-события (могут быть не сравнимы между машинами)" >&2
-  CANDIDATE_EVENTS="cycles instructions cache-references cache-misses"
+  PERF_EVENTS="cycles,instructions,cache-references,cache-misses"
 fi
 
 echo "CPU vendor: $CPU_VENDOR"
-
-
-: > "$OUT_DIR/perf_events_check.log"
-OK_EVENTS=()
-for ev in $CANDIDATE_EVENTS; do
-  if sudo perf stat -e "$ev" -x, -- sleep 0.05 >/dev/null 2>>"$OUT_DIR/perf_events_check.log"; then
-    OK_EVENTS+=("$ev")
-  else
-    echo "[WARN] событие '$ev' не поддерживается этим CPU/ядром — исключаю из сбора" >&2
-  fi
-done
-
-if [[ ${#OK_EVENTS[@]} -eq 0 ]]; then
-  echo "[FATAL] Ни одно perf-событие не прошло проверку. Смотри $OUT_DIR/perf_events_check.log и 'perf list'." >&2
-  exit 1
-fi
-
-PERF_EVENTS="$(IFS=,; echo "${OK_EVENTS[*]}")"
-echo "perf events (после проверки): $PERF_EVENTS"
+echo "perf events: $PERF_EVENTS"
 
 PSQL_BASE=(psql -h "$DB_HOST" -p "$DB_PORT" -d "$DB_NAME" -U "$DB_USER")
 
@@ -68,6 +50,7 @@ COMMON_ARGS=(
   --case-type "$CASE_TYPE"
   --host "$DB_HOST" --port "$DB_PORT" --db-name "$DB_NAME" --user-name "$DB_USER"
   --m "$HNSW_M" --ef-construction "$HNSW_EF_CONSTRUCTION" --ef-search "$HNSW_EF_SEARCH"
+  --num-concurrency 1 --concurrency-duration 20
   --maintenance-work-mem "$MAINT_WORK_MEM" --max-parallel-workers "$MAX_PARALLEL_WORKERS"
 )
 
@@ -277,89 +260,7 @@ echo "=== ФАЗА 2 завершена ==="
 echo ""
 echo "=== Собираю metrics.csv из всех сегментов ==="
 
-OUT_DIR="$OUT_DIR" python3 - <<'PY'
-import csv, glob, os, re
-
-out_dir = os.environ["OUT_DIR"]
-# Раньше здесь был жёсткий список из 4 generic-имён. Теперь события
-# зависят от вендора CPU (см. PERF_EVENTS в самом скрипте) и могут
-# называться L2_RQSTS.MISS, l2_cache_miss, LLC-load-misses и т.д.
-# Отбрасываем только явный мусор perf (пустые строки/интерлив), а не
-# конкретные имена — иначе новые события будут молча вырезаны.
-event_re = re.compile(r"^[A-Za-z0-9_.\-]+$")
-rows = []
-
-for meta_path in sorted(glob.glob(os.path.join(out_dir, "perf_*.seg*.meta"))):
-    csv_path = meta_path[:-5] + ".csv"
-    if not os.path.exists(csv_path):
-        continue
-
-    meta = {}
-    pids_field = ""
-    with open(meta_path) as mf:
-        for line in mf:
-            line = line.strip()
-            if not line or "=" not in line:
-                continue
-            k, _, v = line.partition("=")
-            if k == "pids":
-                pids_field = v
-            else:
-                meta[k] = v
-
-    # pids_field выглядит как "1234:build-index,1235:build-index" —
-    # вытаскиваем точную под-роль (build-load / build-index / search),
-    # чтобы можно было сравнивать build-index отдельно от build-load.
-    role_names = set()
-    for item in pids_field.split(","):
-        if ":" in item:
-            role_names.add(item.split(":", 1)[1])
-    if len(role_names) == 1:
-        role_value = next(iter(role_names))
-    elif role_names:
-        role_value = "mixed(" + "+".join(sorted(role_names)) + ")"
-    else:
-        role_value = ""
-
-    with open(csv_path, newline="") as cf:
-        for raw in cf:
-            raw = raw.rstrip("\n")
-            if not raw or raw.startswith("#"):
-                continue
-            fields = raw.split(",")
-            # perf stat -x, -I <ms> формат:
-            # time,value,unit,event,run_time_ns,pct_time_enabled[,...]
-            if len(fields) < 4:
-                continue
-            timestamp, value, unit, event = fields[0], fields[1], fields[2], fields[3]
-            run_ns = fields[4] if len(fields) > 4 else ""
-            pct = fields[5] if len(fields) > 5 else ""
-            if not event_re.match(event):
-                continue
-            rows.append({
-                "phase": meta.get("phase", ""),
-                "role": role_value,
-                "segment": meta.get("segment", ""),
-                "start_epoch": meta.get("start_epoch", ""),
-                "timestamp_sec": timestamp,
-                "pids": pids_field,
-                "event": event,
-                "value": value,
-                "unit": unit,
-                "run_time_ns": run_ns,
-                "pct_time_enabled": pct,
-            })
-
-out_csv = os.path.join(out_dir, "metrics.csv")
-fieldnames = ["phase", "role", "segment", "start_epoch", "timestamp_sec", "pids",
-              "event", "value", "unit", "run_time_ns", "pct_time_enabled"]
-with open(out_csv, "w", newline="") as f:
-    w = csv.DictWriter(f, fieldnames=fieldnames)
-    w.writeheader()
-    w.writerows(rows)
-
-print(f"Итоговый CSV: {out_csv} ({len(rows)} строк)")
-PY
+python metrics.py $OUT_DIR
 
 # ================= Итог =================
 echo ""

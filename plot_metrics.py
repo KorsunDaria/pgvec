@@ -22,14 +22,16 @@ PALETTE = {
 CACHE_LEVELS = [
     ("L1", [
         ("L1-dcache-loads", "L1-dcache-load-misses"),
+        ("r0729", "rE860"),
     ]),
     ("L2", [
         ("l2_rqsts.references", "l2_rqsts.miss"),          # Intel (подтверждено perf list)
         ("L2_RQSTS.REFERENCES", "L2_RQSTS.MISS"),           # Intel, на случай другого регистра
-        ("l2_request_g1.all_no_prefetch", "l2_cache_miss"),  # AMD
+        ("r8060", "r0864"),  # AMD
     ]),
     ("L3 / LLC", [
         ("LLC-loads", "LLC-load-misses"),
+        ("rff64", "rff43"),
     ]),
     # Фолбэк для старых прогонов с generic-событиями
     ("cache (generic)", [
@@ -45,7 +47,7 @@ def color_for(group_name: str) -> str:
 
 
 def find_latest_csv():
-    base = os.path.expanduser("~/perf-results")
+    base = os.path.expanduser("perf-results")
     dirs = sorted(glob.glob(os.path.join(base, "*")), key=os.path.getmtime)
     for d in reversed(dirs):
         p = os.path.join(d, "metrics.csv")
